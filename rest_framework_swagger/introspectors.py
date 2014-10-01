@@ -1,9 +1,11 @@
+# coding=utf-8
 """Handles the instrospection of REST Framework Views and ViewSets."""
 from abc import ABCMeta, abstractmethod
 import re
 
 from django.contrib.admindocs.utils import trim_docstring
-
+from django.utils.html import escape
+import markdown
 from rest_framework.views import get_view_name, get_view_description
 
 
@@ -20,8 +22,7 @@ class IntrospectorHelper(object):
     @staticmethod
     def strip_params_from_docstring(docstring):
         """
-        Strips the params from the docstring (ie. myparam -- Some param) will
-        not be removed from the text body
+        Strips the params from the docstring (ie. myparam -- Some param)
         """
         split_lines = trim_docstring(docstring).split('\n')
 
@@ -34,7 +35,7 @@ class IntrospectorHelper(object):
         if cut_off is not None:
             split_lines = split_lines[0:cut_off]
 
-        return "<br/>".join(split_lines)
+        return u'\n'.join(split_lines)
 
     @staticmethod
     def get_serializer_name(serializer):
@@ -42,7 +43,6 @@ class IntrospectorHelper(object):
             return None
 
         return serializer.__name__
-
 
     @staticmethod
     def get_view_description(callback):
@@ -113,15 +113,15 @@ class BaseMethodIntrospector(object):
         docstring = ""
 
         class_docs = trim_docstring(get_view_description(self.callback))
-        method_docs = self.get_docs()
+        method_docs = trim_docstring(self.get_docs())
 
         if class_docs is not None:
             docstring += class_docs
         if method_docs is not None:
-            docstring += '\n' + method_docs
+            docstring += '\n\n' + method_docs
 
         docstring = IntrospectorHelper.strip_params_from_docstring(docstring)
-        docstring = docstring.replace("\n\n", "<br/>")
+        docstring = markdown.markdown(escape(docstring))
 
         return docstring
 
@@ -135,7 +135,7 @@ class BaseMethodIntrospector(object):
         path_params = self.build_path_parameters()
         body_params = self.build_body_parameters()
         form_params = self.build_form_parameters()
-        query_params = self.build_query_params_from_docstring()
+        parsed_params = self.parse_params_from_docstring()
 
         if path_params:
             params += path_params
@@ -146,8 +146,8 @@ class BaseMethodIntrospector(object):
             if not form_params and body_params is not None:
                 params.append(body_params)
 
-        if query_params:
-            params += query_params
+        if parsed_params:
+            params += parsed_params
 
         return params
 
@@ -239,10 +239,12 @@ class BaseMethodIntrospector(object):
 
         return data
 
-    def build_query_params_from_docstring(self):
+    def parse_params_from_docstring(self):
         params = []
 
-        docstring = self.retrieve_docstring() if None else ''
+        docstring = self.retrieve_docstring()
+        if docstring is None:
+            docstring = ''
         docstring += "\n" + get_view_description(self.callback)
 
         if docstring is None:
@@ -253,10 +255,31 @@ class BaseMethodIntrospector(object):
         for line in split_lines:
             param = line.split(' -- ')
             if len(param) == 2:
-                params.append({'paramType': 'query',
-                               'name': param[0].strip(),
-                               'description': param[1].strip(),
-                               'dataType': ''})
+
+                param_name = param[0].strip()
+                param_description = param[1].strip()
+                param_type = 'query'
+                param_types = {
+                    'GET': 'query',
+                    'POST': 'form',
+                    'HEADER': 'header',
+                }
+                data_type = 'string'
+
+                match = re.search(r'^(GET|POST|HEADER):(.*)', param_name)
+                if match:
+                    param_type = param_types.get(match.group(1))
+                    param_name = match.group(2).strip()
+
+                match = re.search(r'(.*)\((.*)\)', param_description)
+                if match:
+                    param_description = match.group(1).strip()
+                    data_type = match.group(2)
+
+                params.append({'paramType': escape(param_type),
+                               'name': escape(param_name),
+                               'description': escape(param_description),
+                               'dataType': escape(data_type)})
 
         return params
 
@@ -287,14 +310,34 @@ class ViewSetIntrospector(BaseViewIntrospector):
             yield ViewSetMethodIntrospector(self, methods[method], method)
 
     def _resolve_methods(self):
-        if not hasattr(self.pattern.callback, 'func_code') or \
-                not hasattr(self.pattern.callback, 'func_closure') or \
-                not hasattr(self.pattern.callback.func_code, 'co_freevars') or \
-                'actions' not in self.pattern.callback.func_code.co_freevars:
-            raise RuntimeError('Unable to use callback invalid closure/function specified.')
+        import six
 
-        idx = self.pattern.callback.func_code.co_freevars.index('actions')
-        return self.pattern.callback.func_closure[idx].cell_contents
+        callback = self.pattern.callback
+
+        if six.PY3:
+            code_attr = '__code__'
+            closure_attr = '__closure__'
+        else:
+            code_attr = 'func_code'
+            closure_attr = 'func_closure'
+
+        code = getattr(callback, code_attr)
+        closure = getattr(callback, closure_attr)
+
+        if code and getattr(code, 'co_name') == 'wrapped_view':
+            # lets unwrap!
+            view = getattr(closure[0], 'cell_contents')
+            closure = getattr(view, closure_attr)
+            code = getattr(view, code_attr)
+            freevars = code.co_freevars
+
+        elif code and getattr(code, 'co_name') == 'view':
+            freevars = code.co_freevars
+        else:
+            raise RuntimeError(
+                'Unable to use callback invalid closure/function specified.')
+
+        return closure[freevars.index('actions')].cell_contents
 
 
 class ViewSetMethodIntrospector(BaseMethodIntrospector):
